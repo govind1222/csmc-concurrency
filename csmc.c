@@ -5,12 +5,12 @@
 #include <unistd.h>
 #include <string.h>
 
+// maintains state for each student
 struct student {
     int id;
     int priority;
     int numHelped;
     int tutorId;
-    int beingHelped;
 };
 
 // command line arguments
@@ -19,191 +19,234 @@ int num_tutors;
 int num_chairs;
 int num_help;
 
+// global variables needed for output
 int available_chairs;
-int available_tutors;
-
 int num_students_helped = 0;
 int num_requests = 0;
 int num_students_receiving_help = 0;
 int total_sessions_completed = 0;
-int student_just_arrived = -1;
 
+// semaphores to notify coordinator and tutor that students are waiting
 sem_t notify_coordinator;
 sem_t notify_tutor;
 
+// array of semaphores, one for each student - used to wake up student after tutoring
+sem_t *semaphores;
+
 pthread_mutex_t seats;
 pthread_mutex_t priorityQueueLock;
-pthread_mutex_t finishedTutoringLock;
 
+// array of student and tutor pthreads
 pthread_t *students;
 pthread_t *tutors;
+// only one pthread for coordinator
 pthread_t coordinator;
 
+// array of student structs, one for each student specified
 struct student *studentPriorityStorage;
 
+// shared data structure to maintain priority, tutor selects student
+// with highest priority
 int **priorityQueue;
 
+// shared data structure to keep track of which student just arrived
+// used by coordinator to place into priority queue
+int *studentArrivedOrder;
+
+// function that causes student thread to sleep to simulate programming
 void simulate_programming() {
     // returns a random number between 0 and 2000 ms
     int time = rand() % 2001;
-    usleep(time * 1000);
+    usleep(time);
 }
 
+// function that causes thread to sleep to simulate tutoring
 void simulate_tutoring() {
-    // sleep for 0.2 s
-    // 200 ms * 1000 to convert it into microseconds
-    usleep(200 * 1000);
+    // sleep for 0.2 ms
+    // .2 ms * 1000 to convert it into microseconds
+    usleep(200);
 }
 
-void student_function(void *studentStruct) {
-    struct student *studentPriority = (struct student*)studentStruct;
-
-    while (1) {
-        if (studentPriority->numHelped >= num_help) {
-            // exit the thread here
-            sem_post(&notify_coordinator);
-            pthread_exit(NULL);
-        }
-
-        simulate_programming();
-
-        pthread_mutex_lock(&seats);
-        if(available_chairs >= 1) {
-            available_chairs--;
-            num_requests++;
-            //pthread_mutex_lock(&finishedTutoringLock);
-            student_just_arrived = studentPriority->id;
-            //pthread_mutex_unlock(&finishedTutoringLock);
-            printf("S: Student %d takes a seat. Empty chairs = %d.\n", studentPriority->id, available_chairs);
-            // notifies coordinator that a student has arrived
-            sem_post(&notify_coordinator);
-
-            // being tutored here
-            // printf("er\n");
-            // while the number of times this student has been helped is equal to the old value
-            // student is still being tutored -> while loop
-            //while(studentPriority->beingHelped == 0);
-
-            printf("S: Student %d recieved help from Tutor %d.\n", studentPriority->id, studentPriority->tutorId);
-
-            studentPriority->priority--;
-            studentPriority->numHelped++;
-            studentPriority->tutorId = -1;
-            pthread_mutex_lock(&finishedTutoringLock);
-            studentPriority->beingHelped = 0;
-            pthread_mutex_unlock(&finishedTutoringLock);
-
-
-        }
-        else {
-            printf("S: Student %d found no empty chair. Will try again later.\n", studentPriority->id);
-        }
-
-        pthread_mutex_unlock(&seats);
+// terminates all the tutors
+void terminate_tutors() {
+    int i;
+    for (i = 0; i < num_tutors; i++) {
+        sem_post(&notify_tutor);
     }
 }
 
-void tutor_function(void* id) {
-    int tutorID = *(int *)id;
-    int studentID = -1;
+void * student_function(void *studentStruct) {
+    struct student *studentPriority = (struct student*)studentStruct;
 
-    while(1) {
+    for (;;) {
 
-        // total sessions that can be completed is == num_help * num_students
-        if(total_sessions_completed == num_help * num_students) {
-            // all threads finished
+        // checks to see if thread should terminate
+        if(total_sessions_completed >= num_students * num_help || studentPriority->numHelped >= num_help) {
+            sem_post(&notify_coordinator);
             pthread_exit(NULL);
         }
 
-        // wait for coordinator to notify a tutor that a student
-        // is waiting in the queue to recieve help
-        sem_wait(&notify_tutor);
+        // programs for a bit and then decides to go to the CSMC
+        simulate_programming();
 
-        pthread_mutex_lock(&priorityQueueLock);
-        int i, j = 0;
-        for (i = 0; i < num_help; i++) {
-            for (j = 0; j < num_students; j++) {
-                if(priorityQueue[i][j] > 0) {
-                    studentID = priorityQueue[i][j];
-                    // setting this to negative 2 instead of negative 1 to indicate that this spot had been taken before
-                    // and lets coordinator know not to schedule someone at this spot in the future
-                    priorityQueue[i][j] = -2;
-                    i = num_help;
-                    break;
-                }
-            }
-        }
-
-        // no student found in queue
-        if(studentID <= 0) {
-            pthread_mutex_unlock(&priorityQueueLock);
+        // checks to see if there is a seat available
+        pthread_mutex_lock(&seats);
+        // if there are no seats available, go back to programming
+        if(available_chairs <= 0) {
+            printf("S: Student %d found no empty chair. Will try again later.\n", studentPriority->id);
+            //printf("empty chairs: %d", available_chairs);
+            pthread_mutex_unlock(&seats);
             continue;
         }
 
-        // if execution reaches this point, then a student to tutor has been found
+        available_chairs--;
+        //printf("student %d decrementing", studentPriority->id);
+        pthread_mutex_unlock(&seats);
 
-        num_students_receiving_help++;
-
-        available_chairs++;
-
-        pthread_mutex_unlock(&priorityQueueLock);
-
-        simulate_tutoring();
-
+        // enters this student into the data structure that keeps track of students
+        // that just arrived to the CSMC
         pthread_mutex_lock(&priorityQueueLock);
-        total_sessions_completed++;
-
-        studentPriorityStorage[studentID-1].beingHelped = 1;
-        studentPriorityStorage[studentID-1].tutorId = tutorID;
-
-        printf("T: Student %d tutored by Tutor %d. Students tutored now = %d. Total sessions tutored = %d.\n",
-               studentID, tutorID, num_students_receiving_help, total_sessions_completed);
-
-        num_students_receiving_help--;
-        studentID = -1;
-
+        int i;
+        for (i = 0; i < num_students * num_help; i++) {
+            if(studentArrivedOrder[i] != -1) {
+                continue;
+            }
+            studentArrivedOrder[i] = studentPriority->id;
+            break;
+        }
+        printf("S: Student %d takes a seat. Empty chairs = %d.\n", studentPriority->id, available_chairs);
         pthread_mutex_unlock(&priorityQueueLock);
 
+        // notify coordinator
+        sem_post(&notify_coordinator);
+
+        // wait to be tutored
+        sem_wait(&semaphores[studentPriority->id - 1]);
+
+        // after student has been tutored, increment number of available seats
+        pthread_mutex_lock(&seats);
+        available_chairs++;
+        //printf("student %d incrementing", studentPriorityStorage[student - 1].id);
+        pthread_mutex_unlock(&seats);
+
+        //after being tutored
+        if(studentPriority->tutorId > 0) {
+            printf("S: Student %d received help from Tutor %d.\n", studentPriority->id, studentPriority->tutorId);
+        }
+        // TODO : may need to put these in a lock to prevent rescheduling with same priority
+
+        // tutor id reset, and priority goes down. number of times student has been helped
+        // increases by one
+        studentPriority->tutorId = -1;
+        studentPriority->numHelped++;
+        studentPriority->priority--;
 
     }
 }
 
-void coordinator_function(void) {
+void * tutor_function(void* id) {
+    int tutor = *(int *)id;
+    int student;
+    for (;;) {
 
-    int currentStudentId;
-    while(1) {
+        student = 0;
 
-        // total sessions that can be completed is == num_help * num_students
-        if(total_sessions_completed >= num_help * num_students) {
-            // all sessions finished - terminate tutors
-            int i;
-            for(i = 0; i < num_tutors; i++) {
-                sem_post(&notify_tutor);
-            }
-
+        if (total_sessions_completed >= num_students * num_help) {
             pthread_exit(NULL);
         }
 
-        // coordinator waits for a student to notify that they are in line
-        sem_wait(&notify_coordinator);
+        sem_wait(&notify_tutor);
+
 
         pthread_mutex_lock(&priorityQueueLock);
-        currentStudentId = student_just_arrived - 1;
-        int priorityIndex = num_help - studentPriorityStorage[currentStudentId].priority;
-        int i;
-        for(i = 0; i < num_students; i++) {
-            if(priorityIndex < num_help && priorityQueue[priorityIndex][i] == -1) {
-
-                priorityQueue[priorityIndex][i] = studentPriorityStorage[currentStudentId].id;
-                printf("C: Student %d with priority %d in the queue. Waiting students now = %d. Total requests = %d.\n",
-                       currentStudentId + 1, studentPriorityStorage[currentStudentId].priority, (num_chairs - available_chairs), num_requests);
-
-                sem_post(&notify_tutor);
-                student_just_arrived = -1;
+        int i = 0, j = 0;
+        for (i = 0; i < num_help && !student; i++) {
+            for (j = 0; j < num_students; j++) {
+                if(priorityQueue[i][j] <= 0) {
+                    continue;
+                }
+                student = priorityQueue[i][j];
+                priorityQueue[i][j] = -2;
                 break;
             }
         }
         pthread_mutex_unlock(&priorityQueueLock);
+
+        // no student found
+        if(student == 0) {
+            continue;
+        }
+
+        total_sessions_completed++;
+
+
+        num_students_receiving_help++;
+        studentPriorityStorage[student - 1].tutorId = tutor;
+        simulate_tutoring();
+
+        sem_post(&semaphores[student - 1]);
+
+        num_students_helped++;
+        printf("T: Student %d tutored by Tutor %d. Students tutored now = %d. Total sessions tutored = %d.\n", student, tutor, num_students_receiving_help, num_students_helped);
+
+        num_students_receiving_help--;
+
+
+    }
+}
+
+void enterIntoPriorityQueue(int i) {
+    int student = studentArrivedOrder[i];
+    int priority = num_help - studentPriorityStorage[student - 1].priority;
+    int k;
+
+    if(student <= 0 || studentPriorityStorage[student - 1].numHelped >= num_help) {
+        return;
+    }
+    for (k = 0; k < num_students; k++) {
+        if(priorityQueue[priority][k] != -1) {
+            continue;
+        }
+        priorityQueue[priority][k] = student;
+        printf("C: Student %d with priority %d in the queue. Waiting students now = %d. Total requests = %d.\n",
+               student, studentPriorityStorage[student - 1].priority, num_chairs - available_chairs, num_requests);
+        //sem_post(&notify_tutor);
+        break;
+    }
+}
+
+void * coordinator_function(void) {
+
+    //int student;
+    for (;;) {
+        //student = -1;
+        if (total_sessions_completed >= num_help * num_students) {
+
+            // terminate all tutors
+            terminate_tutors();
+            pthread_exit(NULL);
+        }
+
+        sem_wait(&notify_coordinator);
+        num_requests++;
+
+        pthread_mutex_lock(&priorityQueueLock);
+        int i;
+        for (i = 0; i < num_students * num_help; i++) {
+            if(studentArrivedOrder[i] <= 0) {
+                continue;
+            }
+
+            enterIntoPriorityQueue(i);
+            studentArrivedOrder[i] = -2;
+            sem_post(&notify_tutor);
+
+        }
+
+
+        pthread_mutex_unlock(&priorityQueueLock);
+
+
 
 
     }
@@ -211,7 +254,7 @@ void coordinator_function(void) {
 
 int main(int argc, char *argv[]) {
 
-    if(argc != 5) {
+    if(argc < 5) {
         return -1;
     }
 
@@ -224,16 +267,18 @@ int main(int argc, char *argv[]) {
         return 0;
     }
 
+    time_t t;
+    srand(time(&t));
+
     available_chairs = num_chairs;
-    available_tutors = num_tutors;
 
     // im not sure about the parameter list
     sem_init(&notify_coordinator, 0, 0);
     sem_init(&notify_tutor, 0, 0);
+    //sem_init(&seats, 0, 1);
 
     pthread_mutex_init(&seats, NULL);
     pthread_mutex_init(&priorityQueueLock, NULL);
-    pthread_mutex_init(&finishedTutoringLock, NULL);
 
     students = (pthread_t *)malloc(num_students * sizeof(pthread_t));
     tutors = (pthread_t *)malloc(num_tutors * sizeof(pthread_t));
@@ -254,9 +299,22 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    studentArrivedOrder = (int *)malloc(num_help * num_students * sizeof(int));
+    for (i = 0; i < num_help * num_students; i++) {
+        studentArrivedOrder[i] = -1;
+    }
 
-    time_t t;
-    srand(time(&t));
+    semaphores = (sem_t *)malloc(num_students * sizeof(sem_t));
+    for (i = 0; i < num_students; i++) {
+        sem_init(&semaphores[i], 0, 0);
+    }
+
+
+
+    if(pthread_create(&coordinator, NULL, (void *)coordinator_function, NULL)) {
+        return -1;
+    }
+
 
     // create num_student # of student threads and initialize a struct for each student to keep
     // track of its state
@@ -265,7 +323,6 @@ int main(int argc, char *argv[]) {
         studentPriorityStorage[i].priority = num_help;
         studentPriorityStorage[i].numHelped = 0;
         studentPriorityStorage[i].tutorId = -1;
-        studentPriorityStorage[i].beingHelped = 0;
         // making sure thread was created successfully
         if (pthread_create(&students[i], NULL, (void *)student_function, (void *)&studentPriorityStorage[i])) {
             // TODO ERROR
@@ -280,10 +337,6 @@ int main(int argc, char *argv[]) {
             // TODO ERROR
             return -1;
         }
-    }
-
-    if(pthread_create(&coordinator, NULL, (void *)coordinator_function, NULL)) {
-        return -1;
     }
 
     // wait for all student threads to terminate
